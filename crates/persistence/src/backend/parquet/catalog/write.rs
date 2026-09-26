@@ -27,9 +27,8 @@ use super::{
     Instrument, InstrumentAny, NautilusDataType, NautilusRecordType, ObjectPath, ObjectStoreExt,
     Params, ParquetDataCatalog, PathBuf, RecordBatch, Serialize, UnixNanos,
     WRITE_SKIP_DISJOINT_CHECK, are_intervals_disjoint, instrument_any_type, instrument_path_prefix,
-    parquet_data_path_prefix, prepare_custom_data_batch, record_batch_without_identifier_column,
-    record_path_prefix, timestamps_to_filename, to_snake_case, write_batches_to_object_store,
-    write_catalog_batch,
+    parquet_data_path_prefix, prepare_custom_data_batch, record_path_prefix,
+    timestamps_to_filename, to_snake_case, write_batches_to_object_store, write_catalog_batch,
 };
 use crate::{
     backend::parquet::{io::write_batches_to_object_store_create, paths::catalog_filename},
@@ -323,7 +322,7 @@ impl ParquetDataCatalog {
         let (batch, type_name, identifier, start_ts, end_ts) = prepare_custom_data_batch(data)?;
         let start_ts = start.unwrap_or(start_ts);
         let end_ts = end.unwrap_or(end_ts);
-        let batches = vec![record_batch_without_identifier_column(batch)?];
+        let batches = vec![batch];
 
         let directory = self.make_path_custom_data(&type_name, identifier.as_deref())?;
         self.write_parquet_file_checked(
@@ -691,9 +690,7 @@ impl ParquetDataCatalog {
         let metadata = EncodeToRecordBatch::chunk_metadata(data);
 
         for chunk in data.chunks(self.batch_size) {
-            let record_batch = T::encode_batch(&metadata, chunk)?;
-            let record_batch = record_batch_without_identifier_column(record_batch)?;
-            batches.push(record_batch);
+            batches.push(T::encode_batch(&metadata, chunk)?);
         }
 
         Ok(batches)
@@ -739,7 +736,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::ParquetDataCatalog;
-    use crate::common::datafusion::DataBackendSession;
+    use crate::common::datafusion::{DataBackendSession, identifiers_from_record_batches};
 
     #[rstest]
     fn depth_write_shares_file_metadata_across_chunks(stub_depth10: OrderBookDepth) {
@@ -825,6 +822,36 @@ mod tests {
         assert!(directory.path().join(path).exists());
         assert_eq!(metadata[KEY_PRICE_PRECISION], "2");
         assert_eq!(decoded[2].order.price.precision, 2);
+    }
+
+    #[rstest]
+    fn write_keeps_identifier_column(stub_delta: OrderBookDelta) {
+        let directory = TempDir::new().unwrap();
+        let catalog = ParquetDataCatalog::from_uri(
+            directory.path().to_str().unwrap(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let path = catalog
+            .write_to_parquet(&[stub_delta], None, None, None)
+            .unwrap();
+        let batches = ParquetRecordBatchReaderBuilder::try_new(
+            File::open(directory.path().join(path)).unwrap(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+        assert_eq!(
+            identifiers_from_record_batches(&batches).unwrap(),
+            vec![stub_delta.instrument_id.to_string()]
+        );
     }
 
     #[derive(Debug)]

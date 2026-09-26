@@ -140,7 +140,7 @@ class BacktestEngineConfig:
     @property
     def controller(self) -> trading.ImportableControllerConfig | None: ...
     @property
-    def streaming(self) -> persistence.StreamingConfig | None: ...
+    def streaming(self) -> list[persistence.StreamingConfig] | None: ...
     @property
     def catalogs(self) -> list[persistence.DataCatalogConfig]: ...
     def __new__(
@@ -166,7 +166,7 @@ class BacktestEngineConfig:
         exec_engine: execution.ExecutionEngineConfig | None = None,
         portfolio: portfolio.PortfolioConfig | None = None,
         controller: trading.ImportableControllerConfig | None = None,
-        streaming: persistence.StreamingConfig | None = None,
+        streaming: typing.Sequence[persistence.StreamingConfig] | None = None,
         catalogs: typing.Sequence[persistence.DataCatalogConfig] | None = None,
     ) -> BacktestEngineConfig: ...
 

@@ -43,8 +43,8 @@ use nautilus_model::{
     types::Currency,
 };
 use nautilus_persistence::{
-    config::{DataCatalogConfig, StreamingConfig},
-    python::config::PyCatalogBackend,
+    common::config::DataCatalogConfig,
+    python::config::{PyCatalogBackend, PyStreamingConfig},
 };
 use nautilus_portfolio::config::PortfolioConfig;
 use nautilus_risk::engine::config::RiskEngineConfig;
@@ -114,7 +114,7 @@ impl BacktestEngineConfig {
         exec_engine: Option<ExecutionEngineConfig>,
         portfolio: Option<PortfolioConfig>,
         controller: Option<ImportableControllerConfig>,
-        streaming: Option<StreamingConfig>,
+        streaming: Option<Vec<PyStreamingConfig>>,
         catalogs: Option<Vec<DataCatalogConfig>>,
     ) -> Self {
         let defaults = Self::default();
@@ -141,7 +141,7 @@ impl BacktestEngineConfig {
             exec_engine,
             portfolio,
             controller,
-            streaming,
+            streaming: streaming.map(|configs| configs.into_iter().map(Into::into).collect()),
             catalogs: catalogs.unwrap_or_default(),
         }
     }
@@ -274,8 +274,10 @@ impl BacktestEngineConfig {
 
     #[getter]
     #[pyo3(name = "streaming")]
-    fn py_streaming(&self) -> Option<StreamingConfig> {
-        self.streaming.clone()
+    fn py_streaming(&self) -> Option<Vec<PyStreamingConfig>> {
+        self.streaming
+            .clone()
+            .map(|configs| configs.into_iter().map(Into::into).collect())
     }
 
     #[getter]

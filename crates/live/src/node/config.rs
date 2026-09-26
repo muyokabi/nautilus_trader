@@ -802,9 +802,9 @@ pub struct LiveNodeConfig {
     pub portfolio: Option<PortfolioConfig>,
     /// The order emulator configuration.
     pub emulator: Option<OrderEmulatorConfig>,
-    /// The configuration for streaming to feather files.
+    /// The configurations for independently streaming run data.
     #[cfg(feature = "streaming")]
-    pub streaming: Option<StreamingConfig>,
+    pub streaming: Option<Vec<StreamingConfig>>,
     /// Catalogs registered with the data engine.
     #[cfg(feature = "streaming")]
     #[builder(default)]
@@ -1165,7 +1165,7 @@ impl NautilusKernelConfig for LiveNodeConfig {
     }
 
     #[cfg(feature = "streaming")]
-    fn streaming(&self) -> Option<StreamingConfig> {
+    fn streaming(&self) -> Option<Vec<StreamingConfig>> {
         self.streaming.clone()
     }
 }
@@ -1305,13 +1305,13 @@ mean_dispatch_ns_clear = 700
     #[cfg(feature = "streaming")]
     fn test_validate_runtime_support_accepts_streaming_config() {
         let config = LiveNodeConfig {
-            streaming: Some(StreamingConfig::new(
+            streaming: Some(vec![StreamingConfig::new(
                 "catalog".to_string(),
-                "file".to_string(),
+                None,
                 1_000,
                 false,
                 RotationConfig::NoRotation,
-            )),
+            )]),
             ..Default::default()
         };
 

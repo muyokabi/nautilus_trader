@@ -43,9 +43,9 @@ use nautilus_model::{
     types::{Currency, Money},
 };
 #[cfg(feature = "streaming")]
-use nautilus_persistence::config::CatalogBackendType;
+use nautilus_persistence::common::config::CatalogBackendType;
 #[cfg(feature = "streaming")]
-use nautilus_persistence::config::DataCatalogConfig;
+use nautilus_persistence::common::config::DataCatalogConfig;
 use nautilus_portfolio::config::PortfolioConfig;
 use nautilus_risk::engine::config::RiskEngineConfig;
 use nautilus_system::config::NautilusKernelConfig;
@@ -134,7 +134,7 @@ pub struct BacktestEngineConfig {
     pub controller: Option<ImportableControllerConfig>,
     /// The configuration for streaming to feather files.
     #[cfg(feature = "streaming")]
-    pub streaming: Option<StreamingConfig>,
+    pub streaming: Option<Vec<StreamingConfig>>,
     /// Configurations for existing data catalogs.
     #[cfg(feature = "streaming")]
     #[builder(default)]
@@ -225,7 +225,7 @@ impl NautilusKernelConfig for BacktestEngineConfig {
     }
 
     #[cfg(feature = "streaming")]
-    fn streaming(&self) -> Option<StreamingConfig> {
+    fn streaming(&self) -> Option<Vec<StreamingConfig>> {
         self.streaming.clone()
     }
 

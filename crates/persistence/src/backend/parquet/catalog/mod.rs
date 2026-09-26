@@ -96,7 +96,6 @@ use nautilus_serialization::arrow::{
     ArrowSchemaProvider, DecodeDataFromRecordBatch, DecodeTypedFromRecordBatch,
     EncodeToRecordBatch, catalog_display::catalog_record_batch_to_display,
     custom::CustomDataDecoder, display::instrument::encode_instruments,
-    record_batch_without_identifier_column,
 };
 use object_store::{ObjectStore, ObjectStoreExt, path::Path as ObjectPath};
 use serde::Serialize;
@@ -548,7 +547,7 @@ impl CatalogReader for ParquetDataCatalog {
             }
             #[cfg(feature = "defi")]
             NautilusDataType::Defi => Err(anyhow::Error::from(
-                crate::errors::PersistenceError::unsupported("Parquet catalog DeFi data"),
+                crate::common::errors::PersistenceError::unsupported("Parquet catalog DeFi data"),
             )),
             data_type => query_builtin_batch(
                 self,
@@ -561,7 +560,7 @@ impl CatalogReader for ParquetDataCatalog {
             )
             .unwrap_or_else(|| {
                 Err(anyhow::Error::from(
-                    crate::errors::PersistenceError::unsupported(format!(
+                    crate::common::errors::PersistenceError::unsupported(format!(
                         "Parquet catalog {data_type} data"
                     )),
                 ))

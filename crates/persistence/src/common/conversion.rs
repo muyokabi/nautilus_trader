@@ -13,10 +13,14 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-/// Result of converting one Feather file.
+//! Backend-neutral catalog conversion results.
+
+use crate::catalog::types::CatalogDataType;
+
+/// Summary of one Feather file committed to a transactional catalog.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FeatherConversionSummary {
-    pub type_name: String,
+    pub data_type: CatalogDataType,
     pub identifier: Option<String>,
     pub feather_path: String,
     pub native_version: Option<i64>,

@@ -45,8 +45,6 @@ use std::{
 
 #[cfg(feature = "streaming")]
 use anyhow::Context;
-#[cfg(feature = "streaming")]
-use jiff::tz::TimeZone;
 use nautilus_common::{
     cache::{Cache, CacheConfig, database::CacheDatabaseAdapter},
     clock::Clock,
@@ -72,12 +70,12 @@ use nautilus_execution::{
 use nautilus_model::identifiers::{ClientId, TraderId};
 #[cfg(feature = "streaming")]
 use nautilus_persistence::{
-    backend::default_writer_factories,
-    catalog::traits::NautilusDataTypePrefix,
-    config::StreamingConfig,
+    backend::{default_catalog_factories, default_writer_factories},
+    common::config::{DataCatalogConfig, StreamingConfig},
+    common::{paths::environment_directory, storage::normalize_storage_location},
     writer::{
         factory::{WriterConnectConfig, create_writer, replace_existing_writer_data},
-        feather::{RotationConfig as WriterRotationConfig, WriterClock},
+        feather::WriterClock,
         filter::WriterRecordFilter,
         subscription::StreamingSinkSubscription,
         traits::StreamingDataSink,
@@ -136,9 +134,7 @@ pub struct NautilusKernel {
     event_store_replay: bool,
     state_save_armed: bool,
     #[cfg(feature = "streaming")]
-    streaming_writer: Option<Rc<RefCell<StreamingDataSink>>>,
-    #[cfg(feature = "streaming")]
-    streaming_subscriptions: Option<StreamingSinkSubscription>,
+    streaming_writers: Vec<(String, StreamingSinkSubscription)>,
 }
 
 impl Debug for NautilusKernel {
@@ -201,6 +197,107 @@ impl NautilusKernelDependencies {
 
 impl NautilusKernel {
     #[cfg(feature = "streaming")]
+    fn setup_streaming_writers(
+        environment: Environment,
+        instance_id: UUID4,
+        configs: &[StreamingConfig],
+        clock: &Rc<RefCell<dyn Clock>>,
+    ) -> anyhow::Result<Vec<(String, StreamingSinkSubscription)>> {
+        let factories = default_writer_factories();
+        let mut connections: Vec<(WriterConnectConfig, String)> = Vec::with_capacity(configs.len());
+        for (index, config) in configs.iter().enumerate() {
+            config.validate().map_err(|e| {
+                anyhow::anyhow!("streaming entry {index} at {}: {e}", config.writer_path)
+            })?;
+            let writer_backend = config.writer_backend();
+            anyhow::ensure!(
+                factories.contains_key(&writer_backend.to_string()),
+                "streaming entry {index} at {}: writer backend {writer_backend} is unavailable",
+                config.writer_path,
+            );
+            let (connect, location) = Self::streaming_connection(environment, instance_id, config)?;
+
+            for (previous, (_, previous_location)) in connections.iter().enumerate() {
+                anyhow::ensure!(
+                    location != *previous_location
+                        && !location.starts_with(&format!("{previous_location}/"))
+                        && !previous_location.starts_with(&format!("{location}/")),
+                    "streaming entries {previous} and {index} have overlapping staging locations: {previous_location} and {location}"
+                );
+            }
+            connections.push((connect, location));
+        }
+
+        let mut sinks: Vec<(StreamingDataSink, _)> = Vec::with_capacity(configs.len());
+        for (index, (config, (connect, _))) in configs.iter().zip(&connections).enumerate() {
+            let (writer_clock, bridge) = WriterClock::from_shared_clock(clock);
+            let result = (|| {
+                if config.replace_existing {
+                    replace_existing_writer_data(connect)?;
+                }
+                create_writer(&config.writer_backend(), connect, writer_clock, &factories)
+            })();
+
+            match result {
+                Ok(sink) => sinks.push((sink, bridge)),
+                Err(e) => {
+                    for (previous, (mut sink, _)) in sinks.into_iter().enumerate() {
+                        if let Err(close_error) = sink.close() {
+                            log::warn!(
+                                "Failed to close streaming entry {previous} at {} after setup failure: {close_error}",
+                                connections[previous].0.uri
+                            );
+                        }
+                    }
+                    return Err(e.context(format!("streaming entry {index} at {}", connect.uri)));
+                }
+            }
+        }
+
+        Ok(sinks
+            .into_iter()
+            .zip(connections)
+            .enumerate()
+            .map(|(index, ((sink, bridge), (connect, _)))| {
+                let subscription = StreamingSinkSubscription::subscribe_named(
+                    Rc::new(RefCell::new(sink)),
+                    bridge.map(|shared| (clock.clone(), shared)),
+                    format!("streaming entry {index} at {}", connect.uri),
+                );
+                (connect.uri, subscription)
+            })
+            .collect())
+    }
+
+    #[cfg(feature = "streaming")]
+    fn streaming_connection(
+        environment: Environment,
+        instance_id: UUID4,
+        config: &StreamingConfig,
+    ) -> anyhow::Result<(WriterConnectConfig, String)> {
+        let environment_path = environment_directory(environment);
+        let writer_path = config.writer_path.trim_end_matches('/');
+        let location = normalize_storage_location(writer_path)?;
+        let uri = format!("{writer_path}/{environment_path}/{instance_id}");
+        let catalog = config
+            .catalog
+            .as_ref()
+            .map(DataCatalogConfig::connect_config);
+        let mut connect = WriterConnectConfig::new(uri, catalog);
+        connect.rotation_config = config.rotation_config.to_writer_rotation_config();
+        connect.flush_interval_ms =
+            (config.flush_interval_ms > 0).then_some(config.flush_interval_ms);
+        connect.record_filter = Self::writer_record_filter(config);
+        connect.promotion_interval_ms = config.promotion_interval_ms;
+        connect.promote_on_close = config.promote_on_close;
+        connect.delete_feather_after_promotion = config.delete_feather_after_promotion;
+        connect.use_ts_event_for_ts_init = config.use_ts_event_for_ts_init;
+        connect.params.clone_from(&config.params);
+
+        Ok((connect, location))
+    }
+
+    #[cfg(feature = "streaming")]
     fn writer_record_filter(config: &StreamingConfig) -> Option<WriterRecordFilter> {
         let mut filter = config
             .record_types
@@ -210,19 +307,19 @@ impl NautilusKernel {
 
         if let Some(data_types) = &config.data_types {
             for data_type in data_types {
-                filter.insert_prefix(data_type.path_prefix().into_owned(), None);
+                filter.insert(data_type.clone(), None);
             }
         }
 
         if let Some(instrument_types) = &config.instrument_types {
             for instrument_type in instrument_types {
-                filter.insert_instrument_type(instrument_type);
+                filter.insert_instrument_type(*instrument_type);
             }
         }
 
         if let Some(entries) = &config.record_filters {
             for entry in entries {
-                filter.insert(&entry.record_type, entry.identifiers.clone());
+                filter.insert(entry.record_type, entry.identifiers.clone());
             }
         }
 
@@ -372,6 +469,7 @@ impl NautilusKernel {
         let mut data_engine = data_engine;
         #[cfg(feature = "streaming")]
         {
+            let catalog_factories = default_catalog_factories();
             let mut unnamed_index = 0;
             let mut catalog_names = HashSet::new();
 
@@ -388,7 +486,13 @@ impl NautilusKernel {
                     catalog_names.insert(name.clone()),
                     "Duplicate data catalog name '{name}'",
                 );
-                let catalog = catalog_config.create_catalog().with_context(|| {
+                let catalog_backend = catalog_config.catalog_backend().to_string();
+                let Some(factory) = catalog_factories.get(&catalog_backend) else {
+                    anyhow::bail!(
+                        "Catalog backend factory missing from registry: {catalog_backend}"
+                    );
+                };
+                let catalog = factory(&catalog_config.connect_config()).with_context(|| {
                     format!(
                         "Failed to create data catalog from '{}'",
                         catalog_config.path()
@@ -419,50 +523,12 @@ impl NautilusKernel {
         let ts_created = clock.borrow().timestamp_ns();
 
         #[cfg(feature = "streaming")]
-        let (streaming_writer, streaming_subscriptions) = match config.streaming() {
-            Some(streaming_config) => {
-                let environment = config.environment().to_string().to_ascii_lowercase();
-                let base_uri = match streaming_config.fs_protocol.as_str() {
-                    "file" => streaming_config
-                        .catalog_path
-                        .trim_end_matches('/')
-                        .to_string(),
-                    _ if streaming_config.catalog_path.contains("://") => streaming_config
-                        .catalog_path
-                        .trim_end_matches('/')
-                        .to_string(),
-                    protocol => format!(
-                        "{protocol}://{}",
-                        streaming_config.catalog_path.trim_end_matches('/'),
-                    ),
-                };
-                let uri = format!("{base_uri}/{environment}/{instance_id}");
-                let rotation_config = writer_rotation_config(&streaming_config.rotation_config);
-                let mut connect = WriterConnectConfig::new(&uri, None);
-                connect.rotation_config = rotation_config;
-                connect.flush_interval_ms = Some(streaming_config.flush_interval_ms);
-                connect.params.clone_from(&streaming_config.params);
-                connect.record_filter = Self::writer_record_filter(&streaming_config);
-                if streaming_config.replace_existing {
-                    replace_existing_writer_data(&connect)?;
-                }
-                let (writer_clock, bridge) = WriterClock::from_shared_clock(&clock);
-                let writer = Rc::new(RefCell::new(create_writer(
-                    &streaming_config.writer_backend,
-                    &connect,
-                    writer_clock,
-                    &default_writer_factories(),
-                )?));
-                let handler = StreamingSinkSubscription::subscribe_named(
-                    writer.clone(),
-                    bridge.map(|atomic| (Rc::clone(&clock), atomic)),
-                    uri.clone(),
-                );
-                log::info!("Writing data and events to {uri}");
-                (Some(writer), Some(handler))
-            }
-            None => (None, None),
-        };
+        let streaming_writers = Self::setup_streaming_writers(
+            config.environment(),
+            instance_id,
+            &config.streaming().unwrap_or_default(),
+            &clock,
+        )?;
 
         Ok(Self {
             name,
@@ -486,9 +552,7 @@ impl NautilusKernel {
             event_store_replay: false,
             state_save_armed: false,
             #[cfg(feature = "streaming")]
-            streaming_writer,
-            #[cfg(feature = "streaming")]
-            streaming_subscriptions,
+            streaming_writers,
         })
     }
 
@@ -931,6 +995,8 @@ impl NautilusKernel {
         self.stop_engines();
         self.cancel_timers();
 
+        self.close_streaming_writers();
+
         let ts_shutdown = self.clock.borrow().timestamp_ns();
 
         if let Some(event_store) = self.event_store.as_deref_mut() {
@@ -939,8 +1005,7 @@ impl NautilusKernel {
         }
         self.ts_shutdown = Some(ts_shutdown);
         log::info!("Stopped");
-        save_result?;
-        self.flush_streaming()
+        save_result
     }
 
     /// Saves actor and strategy state at most once for the current trader run.
@@ -1051,16 +1116,7 @@ impl NautilusKernel {
             event_store.seal(ts_dispose);
         }
 
-        #[cfg(feature = "streaming")]
-        {
-            if let Some(subscriptions) = self.streaming_subscriptions.take()
-                && let Err(e) = subscriptions.close()
-            {
-                log::warn!("Failed to close streaming writer: {e}");
-            }
-
-            drop(self.streaming_writer.take());
-        }
+        self.close_streaming_writers();
 
         self.data_engine.borrow_mut().dispose();
         self.exec_engine.borrow_mut().dispose();
@@ -1072,21 +1128,49 @@ impl NautilusKernel {
         log::info!("Disposed");
     }
 
-    /// Flushes configured streaming output.
+    /// Reopens the configured streaming writers after [`Self::close_streaming_writers`].
+    ///
+    /// A reset engine runs again under the same instance ID, so the writers reopen in the same
+    /// run folders and keep the files the previous run wrote there.
     ///
     /// # Errors
     ///
-    /// Returns an error if buffered output cannot be written to the configured object store.
-    pub fn flush_streaming(&mut self) -> anyhow::Result<()> {
+    /// Returns an error if a writer cannot be created.
+    pub fn reopen_streaming_writers(&mut self) -> anyhow::Result<()> {
         #[cfg(feature = "streaming")]
-        if let Some(writer) = &self.streaming_writer {
-            writer
-                .borrow_mut()
-                .flush()
-                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        if self.streaming_writers.is_empty() {
+            let configs = self
+                .config
+                .streaming()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|mut config| {
+                    config.replace_existing = false;
+                    config
+                })
+                .collect::<Vec<_>>();
+            self.streaming_writers = Self::setup_streaming_writers(
+                self.config.environment(),
+                self.instance_id,
+                &configs,
+                &self.clock,
+            )?;
         }
+
         Ok(())
     }
+
+    #[cfg(feature = "streaming")]
+    pub fn close_streaming_writers(&mut self) {
+        for (index, (destination, writer)) in self.streaming_writers.drain(..).enumerate() {
+            if let Err(e) = writer.close() {
+                log::warn!("Failed to close streaming entry {index} at {destination}: {e}");
+            }
+        }
+    }
+
+    #[cfg(not(feature = "streaming"))]
+    pub fn close_streaming_writers(&mut self) {}
 
     /// Starts all engine components.
     fn start_engines(&self) {
@@ -1170,27 +1254,6 @@ impl NautilusKernel {
     #[must_use]
     pub fn exec_client_connection_status(&self) -> Vec<(ClientId, bool)> {
         self.exec_engine.borrow().client_connection_status()
-    }
-}
-
-#[cfg(feature = "streaming")]
-fn writer_rotation_config(config: &crate::config::RotationConfig) -> WriterRotationConfig {
-    match config {
-        crate::config::RotationConfig::Size { max_size } => WriterRotationConfig::Size {
-            max_size: *max_size,
-        },
-        crate::config::RotationConfig::Interval { interval_ns } => WriterRotationConfig::Interval {
-            interval_ns: interval_ns.as_u64(),
-        },
-        crate::config::RotationConfig::ScheduledDates {
-            interval_ns,
-            schedule_ns,
-        } => WriterRotationConfig::ScheduledDates {
-            interval_ns: interval_ns.as_u64(),
-            rotation_time: *schedule_ns,
-            rotation_timezone: TimeZone::UTC,
-        },
-        crate::config::RotationConfig::NoRotation => WriterRotationConfig::NoRotation,
     }
 }
 
@@ -1287,15 +1350,17 @@ mod streaming_tests {
         messages::data::{DataCommand, QuotesResponse, RequestCommand, RequestQuotes},
         msgbus::{self, MStr, ShareableMessageHandler},
     };
-    use nautilus_core::DurationNanos;
     use nautilus_model::{
         data::{CustomData, DataType, NautilusDataType, QuoteTick},
         identifiers::InstrumentId,
         types::{Price, Quantity},
     };
     use nautilus_persistence::{
-        backend::parquet::catalog::ParquetDataCatalog, config::DataCatalogConfig,
-        test_data::RustTestCustomData, writer::feather::RotationConfig as WriterRotationConfig,
+        backend::parquet::catalog::ParquetDataCatalog,
+        common::{
+            config::{CatalogBackendType, DataCatalogConfig},
+            test_data::RustTestCustomData,
+        },
     };
     use nautilus_serialization::ensure_custom_data_registered;
     use rstest::rstest;
@@ -1304,69 +1369,155 @@ mod streaming_tests {
     use super::*;
     use crate::config::{KernelConfig, RotationConfig, StreamingConfig};
 
-    #[rstest]
-    #[case(
-        RotationConfig::Size { max_size: 17 },
-        WriterRotationConfig::Size { max_size: 17 }
-    )]
-    #[case(
-        RotationConfig::Interval {
-            interval_ns: DurationNanos::new(23),
-        },
-        WriterRotationConfig::Interval {
-            interval_ns: 23,
-        }
-    )]
-    #[case(
-        RotationConfig::ScheduledDates {
-            interval_ns: DurationNanos::new(31),
-            schedule_ns: UnixNanos::from(37),
-        },
-        WriterRotationConfig::ScheduledDates {
-            interval_ns: 31,
-            rotation_time: UnixNanos::from(37),
-            rotation_timezone: TimeZone::UTC,
-        }
-    )]
-    #[case(RotationConfig::NoRotation, WriterRotationConfig::NoRotation)]
-    fn test_writer_rotation_config(
-        #[case] config: RotationConfig,
-        #[case] expected: WriterRotationConfig,
-    ) {
-        let actual = writer_rotation_config(&config);
+    fn temp_catalog_path(test_name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("nautilus-{test_name}-{}", UUID4::new()));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
 
-        match (actual, expected) {
-            (
-                WriterRotationConfig::Size { max_size: actual },
-                WriterRotationConfig::Size { max_size: expected },
-            )
-            | (
-                WriterRotationConfig::Interval {
-                    interval_ns: actual,
-                },
-                WriterRotationConfig::Interval {
-                    interval_ns: expected,
-                },
-            ) => assert_eq!(actual, expected),
-            (
-                WriterRotationConfig::ScheduledDates {
-                    interval_ns: actual_interval,
-                    rotation_time: actual_time,
-                    rotation_timezone: actual_timezone,
-                },
-                WriterRotationConfig::ScheduledDates {
-                    interval_ns: expected_interval,
-                    rotation_time: expected_time,
-                    rotation_timezone: expected_timezone,
-                },
-            ) => {
-                assert_eq!(actual_interval, expected_interval);
-                assert_eq!(actual_time, expected_time);
-                assert_eq!(actual_timezone, expected_timezone);
+    fn setup_quote() -> QuoteTick {
+        QuoteTick::new(
+            InstrumentId::from("AUD/USD.SIM"),
+            Price::from("1.00001"),
+            Price::from("1.00003"),
+            Quantity::from("100_000"),
+            Quantity::from("200_000"),
+            UnixNanos::from(1_000_000_000),
+            UnixNanos::from(1_000_000_000),
+        )
+    }
+
+    fn streaming_config(writer_path: &std::path::Path) -> StreamingConfig {
+        let mut config = StreamingConfig::new(
+            writer_path.to_string_lossy().to_string(),
+            None,
+            1_000,
+            true,
+            RotationConfig::NoRotation,
+        );
+        config.data_types = Some(vec![NautilusDataType::QuoteTick]);
+        config
+    }
+
+    fn contains_feather_file(path: &std::path::Path) -> bool {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return false;
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if contains_feather_file(&path) {
+                    return true;
+                }
+            } else if path.extension().is_some_and(|ext| ext == "feather") {
+                return true;
             }
-            (WriterRotationConfig::NoRotation, WriterRotationConfig::NoRotation) => {}
-            (actual, expected) => panic!("rotation mismatch: {actual:?} != {expected:?}"),
         }
+        false
+    }
+
+    #[rstest]
+    #[case::equivalent(".")]
+    #[case::nested("nested")]
+    fn staging_conflicts_preserve_existing_files(#[case] suffix: &str) {
+        let root = temp_catalog_path("staging-conflict");
+        let instance_id = UUID4::new();
+        let run_path = root.join("backtest").join(instance_id.to_string());
+        std::fs::create_dir_all(&run_path).unwrap();
+        let existing = run_path.join("existing.feather");
+        std::fs::write(&existing, b"existing stream bytes").unwrap();
+        let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+        let error = NautilusKernel::setup_streaming_writers(
+            Environment::Backtest,
+            instance_id,
+            &[
+                streaming_config(&root),
+                streaming_config(&root.join(suffix)),
+            ],
+            &clock,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("streaming entries 0 and 1 have overlapping staging locations")
+        );
+        assert_eq!(std::fs::read(&existing).unwrap(), b"existing stream bytes");
+        assert_eq!(std::fs::read_dir(&run_path).unwrap().count(), 1);
+        assert!(clock.borrow().timer_names().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[rstest]
+    fn invalid_later_filter_fails_before_replacement() {
+        let root = temp_catalog_path("invalid-stream-filter");
+        let second = temp_catalog_path("invalid-stream-filter-second");
+        let instance_id = UUID4::new();
+        let run_path = root.join("backtest").join(instance_id.to_string());
+        std::fs::create_dir_all(&run_path).unwrap();
+        let existing = run_path.join("existing.feather");
+        std::fs::write(&existing, b"preserve").unwrap();
+        let mut invalid = streaming_config(&second);
+        invalid.data_types = Some(Vec::new());
+        let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+        let error = NautilusKernel::setup_streaming_writers(
+            Environment::Backtest,
+            instance_id,
+            &[streaming_config(&root), invalid],
+            &clock,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("streaming entry 1"));
+        assert!(error.to_string().contains("data_types"));
+        assert_eq!(std::fs::read(&existing).unwrap(), b"preserve");
+        assert_eq!(std::fs::read_dir(&second).unwrap().count(), 0);
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(second).unwrap();
+    }
+
+    #[rstest]
+    fn partial_writer_setup_leaves_no_subscriptions_or_timers() {
+        let root = temp_catalog_path("partial-stream-setup");
+        let instance_id = UUID4::new();
+        let mut first = streaming_config(&root.join("first"));
+        first.replace_existing = false;
+        let mut second = first.clone();
+        second.writer_path = root.join("second").to_string_lossy().to_string();
+        second.catalog = Some(DataCatalogConfig::new(
+            root.join("catalog").to_string_lossy().to_string(),
+            None,
+            Some(CatalogBackendType::Parquet),
+        ));
+        // A file where the Parquet writer must create its run directory fails its setup
+        let blocked_run = root
+            .join("second")
+            .join("backtest")
+            .join(instance_id.to_string());
+        std::fs::create_dir_all(blocked_run.parent().unwrap()).unwrap();
+        std::fs::write(&blocked_run, b"blocking file").unwrap();
+        let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+        let bus = msgbus::get_message_bus();
+        let subscriptions = bus.borrow().subscriptions().len();
+        let error = NautilusKernel::setup_streaming_writers(
+            Environment::Backtest,
+            instance_id,
+            &[first, second],
+            &clock,
+        )
+        .unwrap_err();
+        msgbus::publish_quote("data.quotes.AUD/USD.SIM".into(), &setup_quote());
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "streaming entry 1 at {}/backtest/{instance_id}",
+                root.join("second").to_string_lossy()
+            )
+        );
+        assert_eq!(bus.borrow().subscriptions().len(), subscriptions);
+        assert!(clock.borrow().timer_names().is_empty());
+        assert!(!contains_feather_file(&root));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[rstest]
@@ -1453,7 +1604,7 @@ mod streaming_tests {
         let instance_id = UUID4::new();
         let mut streaming = StreamingConfig::new(
             directory.path().to_string_lossy().into_owned(),
-            "file".to_string(),
+            None,
             1_000,
             false,
             RotationConfig::NoRotation,
@@ -1461,7 +1612,7 @@ mod streaming_tests {
         streaming.data_types = Some(vec![NautilusDataType::QuoteTick]);
         let config = KernelConfig {
             instance_id: Some(instance_id),
-            streaming: Some(streaming),
+            streaming: Some(vec![streaming]),
             ..KernelConfig::default()
         };
         let mut kernel = NautilusKernel::new("BuiltInStreamingTest".to_string(), config).unwrap();
@@ -1478,7 +1629,7 @@ mod streaming_tests {
         );
 
         msgbus::publish_any(MStr::from("data.custom"), &custom);
-        kernel.flush_streaming().unwrap();
+        kernel.close_streaming_writers();
 
         let custom_path = directory
             .path()

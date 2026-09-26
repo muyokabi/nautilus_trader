@@ -765,7 +765,7 @@ class LiveNodeConfig:
     @property
     def exec_clients(self) -> dict: ...
     @property
-    def streaming(self) -> persistence.StreamingConfig | None: ...
+    def streaming(self) -> list[persistence.StreamingConfig] | None: ...
     @property
     def catalogs(self) -> list[persistence.DataCatalogConfig]: ...
     @property
@@ -839,7 +839,7 @@ class LiveNodeConfig:
         exec_engine: LiveExecutionEngineConfig | None = None,
         controller: trading.ImportableControllerConfig | None = None,
         plugins: typing.Sequence[PluginConfig] | None = None,
-        streaming: persistence.StreamingConfig | None = None,
+        streaming: typing.Sequence[persistence.StreamingConfig] | None = None,
         catalogs: typing.Sequence[persistence.DataCatalogConfig] | None = None,
         *,
         data_clients: dict | None = None,
